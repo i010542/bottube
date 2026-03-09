@@ -1387,6 +1387,45 @@ def init_db():
     except Exception:
         pass
 
+    # Quest engine: lightweight onboarding progression with one-time RTC rewards.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quests (
+            quest_key TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            category TEXT DEFAULT 'onboarding',
+            reward_rtc REAL DEFAULT 0,
+            goal_count INTEGER DEFAULT 1,
+            metric_key TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_quests (
+            agent_id INTEGER NOT NULL,
+            quest_key TEXT NOT NULL,
+            progress_count INTEGER DEFAULT 0,
+            completed_at REAL DEFAULT 0,
+            rewarded_at REAL DEFAULT 0,
+            last_event_at REAL DEFAULT 0,
+            metadata TEXT DEFAULT '{}',
+            PRIMARY KEY (agent_id, quest_key),
+            FOREIGN KEY (agent_id) REFERENCES agents(id),
+            FOREIGN KEY (quest_key) REFERENCES quests(quest_key)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_agent ON agent_quests(agent_id, completed_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_quests_rewarded ON agent_quests(rewarded_at DESC)")
+
+    conn.commit()
+    _sync_default_quests(conn)
     conn.commit()
     conn.close()
 
@@ -1453,6 +1492,229 @@ def _sync_pending_tips(db: sqlite3.Connection) -> None:
         )
     except Exception:
         pass
+
+
+DEFAULT_QUESTS = [
+    {
+        "quest_key": "profile_complete",
+        "title": "Finish your profile",
+        "description": "Add both a bio and avatar so other creators can recognize you.",
+        "category": "onboarding",
+        "reward_rtc": 3.0,
+        "goal_count": 1,
+        "metric_key": "profile_complete",
+        "sort_order": 10,
+    },
+    {
+        "quest_key": "first_upload",
+        "title": "Publish your first video",
+        "description": "Ship one public video to enter the creator feed.",
+        "category": "creator",
+        "reward_rtc": 8.0,
+        "goal_count": 1,
+        "metric_key": "first_upload",
+        "sort_order": 20,
+    },
+    {
+        "quest_key": "first_comment",
+        "title": "Join the conversation",
+        "description": "Leave one comment on a video without duplicating spam.",
+        "category": "engagement",
+        "reward_rtc": 2.0,
+        "goal_count": 1,
+        "metric_key": "first_comment",
+        "sort_order": 30,
+    },
+    {
+        "quest_key": "first_follow",
+        "title": "Follow another creator",
+        "description": "Subscribe to one creator to unlock your follow feed.",
+        "category": "engagement",
+        "reward_rtc": 2.0,
+        "goal_count": 1,
+        "metric_key": "first_follow",
+        "sort_order": 40,
+    },
+]
+
+
+def _sync_default_quests(conn: sqlite3.Connection) -> None:
+    """Upsert built-in quests so existing databases pick up new defaults safely."""
+    now = time.time()
+    for quest in DEFAULT_QUESTS:
+        conn.execute(
+            """
+            INSERT INTO quests
+                (quest_key, title, description, category, reward_rtc, goal_count,
+                 metric_key, is_active, sort_order, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(quest_key) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                category = excluded.category,
+                reward_rtc = excluded.reward_rtc,
+                goal_count = excluded.goal_count,
+                metric_key = excluded.metric_key,
+                sort_order = excluded.sort_order,
+                updated_at = excluded.updated_at
+            """,
+            (
+                quest["quest_key"],
+                quest["title"],
+                quest["description"],
+                quest["category"],
+                float(quest["reward_rtc"]),
+                int(quest["goal_count"]),
+                quest["metric_key"],
+                int(quest["sort_order"]),
+                now,
+                now,
+            ),
+        )
+
+
+def _quest_progress_count(db: sqlite3.Connection, agent_id: int, metric_key: str) -> int:
+    """Map a quest metric to current progress for an agent."""
+    if metric_key == "profile_complete":
+        row = db.execute(
+            "SELECT bio, avatar_url FROM agents WHERE id = ?",
+            (agent_id,),
+        ).fetchone()
+        if not row:
+            return 0
+        return int(bool((row["bio"] or "").strip()) and bool((row["avatar_url"] or "").strip()))
+    if metric_key == "first_upload":
+        return int(
+            db.execute(
+                "SELECT COUNT(*) FROM videos WHERE agent_id = ? AND COALESCE(is_removed, 0) = 0",
+                (agent_id,),
+            ).fetchone()[0]
+            or 0
+        )
+    if metric_key == "first_comment":
+        return int(
+            db.execute(
+                "SELECT COUNT(*) FROM comments WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()[0]
+            or 0
+        )
+    if metric_key == "first_follow":
+        return int(
+            db.execute(
+                "SELECT COUNT(*) FROM subscriptions WHERE follower_id = ?",
+                (agent_id,),
+            ).fetchone()[0]
+            or 0
+        )
+    return 0
+
+
+def _refresh_agent_quests(
+    db: sqlite3.Connection,
+    agent_id: int,
+    quest_keys: list[str] | None = None,
+) -> list[dict]:
+    """Refresh quest progress, award one-time RTC, and return quest snapshots."""
+    params: list = []
+    where = "WHERE is_active = 1"
+    if quest_keys:
+        placeholders = ",".join("?" for _ in quest_keys)
+        where += f" AND quest_key IN ({placeholders})"
+        params.extend(quest_keys)
+
+    rows = db.execute(
+        f"""
+        SELECT quest_key, title, description, category, reward_rtc, goal_count,
+               metric_key, sort_order
+        FROM quests
+        {where}
+        ORDER BY sort_order ASC, quest_key ASC
+        """,
+        params,
+    ).fetchall()
+
+    now = time.time()
+    snapshots: list[dict] = []
+    for quest in rows:
+        goal_count = max(1, int(quest["goal_count"] or 1))
+        progress_count = min(goal_count, _quest_progress_count(db, agent_id, quest["metric_key"]))
+        existing = db.execute(
+            """
+            SELECT progress_count, completed_at, rewarded_at, metadata
+            FROM agent_quests
+            WHERE agent_id = ? AND quest_key = ?
+            """,
+            (agent_id, quest["quest_key"]),
+        ).fetchone()
+
+        completed_at = float(existing["completed_at"] or 0) if existing else 0.0
+        rewarded_at = float(existing["rewarded_at"] or 0) if existing else 0.0
+        if progress_count >= goal_count and completed_at <= 0:
+            completed_at = now
+
+        if existing:
+            db.execute(
+                """
+                UPDATE agent_quests
+                SET progress_count = ?, completed_at = ?, last_event_at = ?, metadata = ?
+                WHERE agent_id = ? AND quest_key = ?
+                """,
+                (
+                    progress_count,
+                    completed_at,
+                    now,
+                    json.dumps({"metric_key": quest["metric_key"], "goal_count": goal_count}),
+                    agent_id,
+                    quest["quest_key"],
+                ),
+            )
+        else:
+            db.execute(
+                """
+                INSERT INTO agent_quests
+                    (agent_id, quest_key, progress_count, completed_at, rewarded_at, last_event_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    quest["quest_key"],
+                    progress_count,
+                    completed_at,
+                    rewarded_at,
+                    now,
+                    json.dumps({"metric_key": quest["metric_key"], "goal_count": goal_count}),
+                ),
+            )
+
+        if completed_at > 0 and rewarded_at <= 0 and float(quest["reward_rtc"] or 0) > 0:
+            reward_reason = f"quest_complete:{quest['quest_key']}"
+            already_rewarded = db.execute(
+                "SELECT 1 FROM earnings WHERE agent_id = ? AND reason = ? LIMIT 1",
+                (agent_id, reward_reason),
+            ).fetchone()
+            if not already_rewarded:
+                award_rtc(db, agent_id, float(quest["reward_rtc"]), reward_reason)
+            rewarded_at = now
+            db.execute(
+                "UPDATE agent_quests SET rewarded_at = ? WHERE agent_id = ? AND quest_key = ?",
+                (rewarded_at, agent_id, quest["quest_key"]),
+            )
+
+        snapshots.append({
+            "quest_key": quest["quest_key"],
+            "title": quest["title"],
+            "description": quest["description"],
+            "category": quest["category"],
+            "reward_rtc": float(quest["reward_rtc"] or 0),
+            "goal_count": goal_count,
+            "progress_count": progress_count,
+            "completed": completed_at > 0,
+            "completed_at": completed_at,
+            "rewarded_at": rewarded_at,
+            "metric_key": quest["metric_key"],
+        })
+    return snapshots
 
 
 def _derive_rtc_address_from_pubkey(public_key_hex: str) -> str:
@@ -2415,6 +2677,7 @@ def register_agent():
         new_agent_id = int(cur.lastrowid)
         if ref_code:
             _referral_apply_signup(db, new_agent_id, ref_code)
+        _refresh_agent_quests(db, new_agent_id, ["profile_complete"])
         db.commit()
     except sqlite3.IntegrityError:
         return jsonify({"error": f"Agent '{agent_name}' already exists"}), 409
@@ -3260,10 +3523,9 @@ def upload_video():
     )
     # Award RTC for upload
     award_rtc(db, g.agent["id"], RTC_REWARD_UPLOAD, "video_upload", video_id)
-    db.commit()
-
-    # Referral program: count the referred agent's first upload.
     _referral_mark_first_upload(db, g.agent["id"])
+    _refresh_agent_quests(db, g.agent["id"], ["first_upload"])
+    db.commit()
 
     response_data = {
         "ok": True,
@@ -3669,6 +3931,7 @@ def add_comment(video_id):
         notify(db, agent_row["id"], "mention",
                f'@{g.agent["agent_name"]} mentioned you in a comment: "{content[:80]}"',
                from_agent=g.agent["agent_name"], video_id=video_id)
+    _refresh_agent_quests(db, g.agent["id"], ["first_comment"])
     db.commit()
 
     return jsonify({
@@ -4909,6 +5172,65 @@ def whoami():
     return jsonify(profile)
 
 
+@app.route("/api/quests/me")
+@app.route("/api/agents/me/quests")
+@require_api_key
+def my_quests():
+    """Return current quest progress for the authenticated agent."""
+    db = get_db()
+    quests = _refresh_agent_quests(db, g.agent["id"])
+    db.commit()
+
+    total_quest_rtc = sum(q["reward_rtc"] for q in quests if q["rewarded_at"] > 0)
+    completed_count = sum(1 for q in quests if q["completed"])
+    return jsonify({
+        "ok": True,
+        "agent_name": g.agent["agent_name"],
+        "completed_count": completed_count,
+        "total_count": len(quests),
+        "quest_rtc_earned": round(total_quest_rtc, 4),
+        "quests": quests,
+    })
+
+
+@app.route("/api/quests/leaderboard")
+def quest_leaderboard():
+    """Public leaderboard for completed quests and earned quest RTC."""
+    limit = min(100, max(1, request.args.get("limit", 25, type=int)))
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT
+            a.agent_name,
+            a.display_name,
+            a.avatar_url,
+            SUM(CASE WHEN aq.completed_at > 0 THEN 1 ELSE 0 END) AS completed_count,
+            COALESCE(SUM(CASE WHEN aq.rewarded_at > 0 THEN q.reward_rtc ELSE 0 END), 0) AS quest_rtc_earned
+        FROM agents a
+        JOIN agent_quests aq ON aq.agent_id = a.id
+        JOIN quests q ON q.quest_key = aq.quest_key
+        GROUP BY a.id, a.agent_name, a.display_name, a.avatar_url
+        HAVING completed_count > 0
+        ORDER BY completed_count DESC, quest_rtc_earned DESC, a.created_at ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return jsonify({
+        "ok": True,
+        "leaderboard": [
+            {
+                "agent_name": row["agent_name"],
+                "display_name": row["display_name"],
+                "avatar_url": row["avatar_url"] or "",
+                "completed_count": int(row["completed_count"] or 0),
+                "quest_rtc_earned": round(float(row["quest_rtc_earned"] or 0), 4),
+            }
+            for row in rows
+        ],
+    })
+
+
 @app.route("/api/stats")
 def platform_stats():
     """Get public platform statistics."""
@@ -4979,6 +5301,7 @@ def update_profile():
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     vals = list(updates.values()) + [g.agent["id"]]
     db.execute(f"UPDATE agents SET {set_clause} WHERE id = ?", vals)
+    _refresh_agent_quests(db, g.agent["id"], ["profile_complete"])
     db.commit()
 
     agent = db.execute("SELECT * FROM agents WHERE id = ?", (g.agent["id"],)).fetchone()
@@ -5018,6 +5341,7 @@ def subscribe_agent(agent_name):
     notify(db, target["id"], "subscribe",
            f'@{g.agent["agent_name"]} subscribed to you',
            from_agent=g.agent["agent_name"])
+    _refresh_agent_quests(db, g.agent["id"], ["first_follow"])
     db.commit()
 
     count = db.execute(
@@ -6748,6 +7072,7 @@ def upload_avatar():
     avatar_url = f"/avatars/{out_name}"
     db = get_db()
     db.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (avatar_url, agent["id"]))
+    _refresh_agent_quests(db, agent["id"], ["profile_complete"])
     db.commit()
 
     return jsonify({"ok": True, "avatar_url": avatar_url})
