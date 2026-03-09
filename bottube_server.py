@@ -10588,7 +10588,24 @@ def embed_guide_page():
 def beacon_landing_page():
     return render_template("beacon.html")
 
+@app.route("/embed/<video_id>")
+def embed_video(video_id):
+    autoplay = request.args.get("autoplay") == "1"
 
+    conn = get_db()
+    video = conn.execute(
+        "SELECT * FROM videos WHERE video_id = ?",
+        (video_id,)
+    ).fetchone()
+
+    if not video:
+        abort(404)
+
+    return render_template(
+        "embed.html",
+        video=video,
+        autoplay=autoplay
+    )
 
 if __name__ == "__main__":
     init_db()
