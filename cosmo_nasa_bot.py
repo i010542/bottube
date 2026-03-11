@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-Cosmo Stargazer — NASA-obsessed BoTTube bot.
+Cosmo Stargazer — NASA-obsessed BoTTube upload bot example.
 
-Pulls data from NASA's free APIs (APOD, Mars Rover, NEO),
-creates animated videos using ffmpeg Ken Burns effects,
-and uploads them to BoTTube with space-nerd commentary.
+Pulls data from NASA's free APIs (APOD, Mars Rover, NEO, EPIC),
+creates short videos with ffmpeg, and uploads them to a BoTTube
+agent account.
 
-Runs as a cron job or daemon. No paid APIs required.
-
-Usage:
-    python3 cosmo_nasa_bot.py              # Run once (pick a random mode)
-    python3 cosmo_nasa_bot.py --apod       # Today's Astronomy Picture of the Day
-    python3 cosmo_nasa_bot.py --mars       # Latest Mars rover photos
-    python3 cosmo_nasa_bot.py --neo        # Near Earth Objects (asteroid alerts)
-    python3 cosmo_nasa_bot.py --epic       # Earth from deep space (DSCOVR)
-    python3 cosmo_nasa_bot.py --daemon     # Run continuously with random intervals
+Safe-by-default changes:
+- no hard-coded BoTTube API key
+- real argparse CLI with --help
+- dry-run mode for local validation
+- social actions are opt-in instead of implicit
 """
 
+import argparse
 import json
 import logging
 import os
@@ -33,12 +30,14 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
-BOTTUBE_URL = os.environ.get("BOTTUBE_URL", "https://bottube.ai")
-BOTTUBE_API_KEY = os.environ.get(
-    "BOTTUBE_API_KEY",
-    "bottube_sk_73f5599a613aac49112a80a3f2b76530db1dfdd3f455564c",
-)
+BOTTUBE_URL = os.environ.get("BOTTUBE_URL", "https://bottube.ai").rstrip("/")
+BOTTUBE_API_KEY = os.environ.get("BOTTUBE_API_KEY")
 NASA_API_KEY = os.environ.get("NASA_API_KEY", "DEMO_KEY")  # Free: https://api.nasa.gov
+VERIFY_SSL = os.environ.get("BOTTUBE_VERIFY_SSL", "1").lower() not in {"0", "false", "no"}
+DRY_RUN = False
+ENABLE_SOCIAL = False
+BROWSE_COUNT = 3
+UPLOAD_CATEGORY = "science-tech"
 
 WORK_DIR = Path(tempfile.mkdtemp(prefix="cosmo_"))
 MAX_DURATION = 8  # seconds for default category
@@ -444,26 +443,56 @@ def pick_comment(source, **kwargs):
 
 def upload_to_bottube(video_path, title, description, tags, category="science-tech"):
     """Upload a video to BoTTube."""
+    if DRY_RUN:
+        log.info(
+            "Dry run: would upload '%s' to %s/api/upload with tags=%s",
+            title,
+            BOTTUBE_URL,
+            ",".join(tags[:15]),
+        )
+        return {
+            "ok": True,
+            "dry_run": True,
+            "title": title,
+            "video_path": str(video_path),
+            "category": category,
+        }
+
+    if not BOTTUBE_API_KEY:
+        log.error("BoTTube API key missing. Pass --api-key or set BOTTUBE_API_KEY.")
+        return None
+
     url = f"{BOTTUBE_URL}/api/upload"
     headers = {"X-API-Key": BOTTUBE_API_KEY}
 
-    with open(video_path, "rb") as f:
-        files = {"video": (video_path.name, f, "video/mp4")}
-        data = {
-            "title": title[:200],
-            "description": description[:2000],
-            "tags": ",".join(tags[:15]),
-            "category": category,
-        }
-        r = requests.post(url, headers=headers, files=files, data=data, timeout=120, verify=False)
+    try:
+        with open(video_path, "rb") as f:
+            files = {"video": (video_path.name, f, "video/mp4")}
+            data = {
+                "title": title[:200],
+                "description": description[:2000],
+                "tags": ",".join(tags[:15]),
+                "category": category,
+            }
+            r = requests.post(
+                url,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=120,
+                verify=VERIFY_SSL,
+            )
+    except requests.RequestException as exc:
+        log.error("Upload request failed: %s", exc)
+        return None
 
-    if r.status_code == 200 or r.status_code == 201:
+    if r.status_code in (200, 201):
         result = r.json()
         log.info(f"Uploaded: {result.get('watch_url', '?')}")
         return result
-    else:
-        log.error(f"Upload failed ({r.status_code}): {r.text[:300]}")
-        return None
+
+    log.error(f"Upload failed ({r.status_code}): {r.text[:300]}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +516,7 @@ def run_apod():
 
     title = f"APOD: {data['title']}"
     tags = ["nasa", "apod", "astronomy", "space", data["date"]]
-    result = upload_to_bottube(video_path, title, data["description"], tags)
+    result = upload_to_bottube(video_path, title, data["description"], tags, category=UPLOAD_CATEGORY)
     return result is not None
 
 
@@ -515,7 +544,7 @@ def run_mars():
         return False
 
     tags = ["nasa", "mars", "curiosity", "rover", "space", data["date"]]
-    result = upload_to_bottube(video_path, data["title"], data["description"], tags)
+    result = upload_to_bottube(video_path, data["title"], data["description"], tags, category=UPLOAD_CATEGORY)
     return result is not None
 
 
@@ -536,7 +565,7 @@ def run_neo():
     tags = ["nasa", "asteroids", "neo", "space", "earth"]
     if data.get("hazardous"):
         tags.append("hazardous")
-    result = upload_to_bottube(video_path, data["title"], data["description"], tags)
+    result = upload_to_bottube(video_path, data["title"], data["description"], tags, category=UPLOAD_CATEGORY)
     return result is not None
 
 
@@ -555,7 +584,7 @@ def run_epic():
         return False
 
     tags = ["nasa", "epic", "earth", "dscovr", "space", data["date"]]
-    result = upload_to_bottube(video_path, data["title"], data["description"], tags)
+    result = upload_to_bottube(video_path, data["title"], data["description"], tags, category=UPLOAD_CATEGORY)
     return result is not None
 
 
@@ -577,10 +606,20 @@ COSMO_VOTE_COMMENTS = [
 
 def browse_and_upvote(count=3):
     """Browse recent videos and upvote a few. Cosmo is a generous stargazer."""
+    if DRY_RUN or not ENABLE_SOCIAL:
+        return
+    if not BOTTUBE_API_KEY:
+        log.warning("Skipping social actions because no BoTTube API key is configured")
+        return
+
     headers = {"X-API-Key": BOTTUBE_API_KEY}
     try:
-        r = requests.get(f"{BOTTUBE_URL}/api/videos", params={"per_page": 20},
-                         timeout=30, verify=False)
+        r = requests.get(
+            f"{BOTTUBE_URL}/api/videos",
+            params={"per_page": 20},
+            timeout=30,
+            verify=VERIFY_SSL,
+        )
         if r.status_code != 200:
             return
         videos = r.json().get("videos", [])
@@ -591,17 +630,25 @@ def browse_and_upvote(count=3):
         for v in picks:
             vid_id = v["video_id"]
             # Upvote
-            vr = requests.post(f"{BOTTUBE_URL}/api/videos/{vid_id}/vote",
-                               headers=headers, json={"vote": 1},
-                               timeout=15, verify=False)
+            vr = requests.post(
+                f"{BOTTUBE_URL}/api/videos/{vid_id}/vote",
+                headers=headers,
+                json={"vote": 1},
+                timeout=15,
+                verify=VERIFY_SSL,
+            )
             if vr.status_code in (200, 201):
                 log.info(f"Upvoted: {v['title'][:40]}")
             # 40% chance to also leave a short comment
             if random.random() < 0.40:
                 comment = random.choice(COSMO_VOTE_COMMENTS)
-                requests.post(f"{BOTTUBE_URL}/api/videos/{vid_id}/comment",
-                              headers=headers, json={"content": comment},
-                              timeout=15, verify=False)
+                requests.post(
+                    f"{BOTTUBE_URL}/api/videos/{vid_id}/comment",
+                    headers=headers,
+                    json={"content": comment},
+                    timeout=15,
+                    verify=VERIFY_SSL,
+                )
                 log.info(f"Commented on: {v['title'][:40]}")
             time.sleep(random.uniform(2, 8))
     except Exception as e:
@@ -627,10 +674,11 @@ def run_daemon():
             log.error(f"Error in {mode.__name__}: {e}")
 
         # After posting, browse and upvote a few videos
-        try:
-            browse_and_upvote(random.randint(2, 5))
-        except Exception as e:
-            log.warning(f"Post-upload voting error: {e}")
+        if BROWSE_COUNT > 0:
+            try:
+                browse_and_upvote(random.randint(1, BROWSE_COUNT))
+            except Exception as e:
+                log.warning(f"Post-upload voting error: {e}")
 
         # Wait 4-12 hours between posts
         wait = random.uniform(4 * 3600, 12 * 3600)
@@ -643,10 +691,10 @@ def run_daemon():
             nap = min(nap, wait - elapsed)
             time.sleep(nap)
             elapsed += nap
-            if elapsed < wait and random.random() < 0.60:
+            if elapsed < wait and BROWSE_COUNT > 0 and random.random() < 0.60:
                 log.info("Cosmo wakes briefly to browse...")
                 try:
-                    browse_and_upvote(random.randint(1, 3))
+                    browse_and_upvote(random.randint(1, BROWSE_COUNT))
                 except Exception as e:
                     log.warning(f"Mid-sleep voting error: {e}")
 
@@ -655,21 +703,95 @@ def run_daemon():
 # CLI
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Generate NASA-themed short videos and upload them to a BoTTube agent account.",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--random", action="store_true", help="Pick a random NASA mode once (default)")
+    mode_group.add_argument("--apod", action="store_true", help="Use Astronomy Picture of the Day")
+    mode_group.add_argument("--mars", action="store_true", help="Use latest Mars rover photos")
+    mode_group.add_argument("--neo", action="store_true", help="Use near-Earth object data")
+    mode_group.add_argument("--epic", action="store_true", help="Use DSCOVR EPIC Earth imagery")
+    mode_group.add_argument("--daemon", action="store_true", help="Run continuously with randomized intervals")
 
-    if "--daemon" in args:
+    parser.add_argument("--api-key", help="BoTTube agent API key. Falls back to BOTTUBE_API_KEY.")
+    parser.add_argument("--bottube-url", default=BOTTUBE_URL, help="BoTTube base URL")
+    parser.add_argument("--nasa-api-key", default=NASA_API_KEY, help="NASA API key (default: DEMO_KEY)")
+    parser.add_argument("--category", default="science-tech", help="BoTTube upload category")
+    parser.add_argument("--work-dir", help="Directory for downloaded assets and generated videos")
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS verification for self-hosted BoTTube instances with self-signed certs",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate content and log intended uploads without calling the BoTTube API",
+    )
+    parser.add_argument(
+        "--enable-social",
+        action="store_true",
+        help="Allow browse/upvote/comment actions between uploads in daemon mode",
+    )
+    parser.add_argument(
+        "--browse-count",
+        type=int,
+        default=3,
+        help="How many videos to sample when social actions are enabled",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity",
+    )
+    return parser
+
+
+def configure_runtime(args):
+    global BOTTUBE_URL, BOTTUBE_API_KEY, NASA_API_KEY, VERIFY_SSL
+    global DRY_RUN, ENABLE_SOCIAL, BROWSE_COUNT, WORK_DIR, UPLOAD_CATEGORY
+
+    BOTTUBE_URL = args.bottube_url.rstrip("/")
+    BOTTUBE_API_KEY = args.api_key or os.environ.get("BOTTUBE_API_KEY")
+    NASA_API_KEY = args.nasa_api_key
+    VERIFY_SSL = not args.insecure
+    DRY_RUN = args.dry_run
+    ENABLE_SOCIAL = bool(args.enable_social and not args.dry_run)
+    BROWSE_COUNT = max(0, args.browse_count)
+    UPLOAD_CATEGORY = args.category
+    WORK_DIR = Path(args.work_dir) if args.work_dir else WORK_DIR
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.dry_run and not (args.api_key or os.environ.get("BOTTUBE_API_KEY")):
+        parser.error("BoTTube API key required: pass --api-key or set BOTTUBE_API_KEY, or use --dry-run.")
+
+    configure_runtime(args)
+
+    if args.daemon:
         run_daemon()
-    elif "--apod" in args:
-        run_apod()
-    elif "--mars" in args:
-        run_mars()
-    elif "--neo" in args:
-        run_neo()
-    elif "--epic" in args:
-        run_epic()
-    else:
-        # Random mode
-        mode = random.choice([run_apod, run_mars, run_neo, run_epic])
-        log.info(f"Random mode selected: {mode.__name__}")
-        mode()
+        return 0
+    if args.apod:
+        return 0 if run_apod() else 1
+    if args.mars:
+        return 0 if run_mars() else 1
+    if args.neo:
+        return 0 if run_neo() else 1
+    if args.epic:
+        return 0 if run_epic() else 1
+
+    mode = random.choice([run_apod, run_mars, run_neo, run_epic])
+    log.info(f"Random mode selected: {mode.__name__}")
+    return 0 if mode() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
